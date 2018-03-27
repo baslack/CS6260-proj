@@ -1,9 +1,7 @@
 #include <maya/MFnPlugin.h>
 #include <maya/MTypeId.h> 
-
 #include <maya/MMatrixArray.h>
 #include <maya/MStringArray.h>
-
 #include <maya/MPxSkinCluster.h> 
 #include <maya/MItGeometry.h>
 #include <maya/MItMeshPolygon.h>
@@ -14,6 +12,10 @@
 #include <maya/MQuaternion.h>
 #include <maya/MMatrix.h>
 #include <maya/MTransformationMatrix.h>
+#include <maya/MFnNumericAttribute.h>
+#include <maya/MFnTypedAttribute.h>
+#include <maya/MGlobal.h>
+#include <maya/MFnPointArrayData.h>
 
 #include <vector>
 
@@ -26,11 +28,10 @@ class corSkinCluster : public MPxSkinCluster
 {
 public:
     static  void*   creator();
-    static  MStatus initialize();
+    
+	static  MStatus initialize();
 
-    // Deformation function
-    //
-    virtual MStatus deform(MDataBlock    &block,
+	virtual MStatus deform(MDataBlock    &block,
                            MItGeometry   &iter,
                            const MMatrix &mat,
                            unsigned int   multiIndex);
@@ -39,25 +40,17 @@ public:
 	
     static const MTypeId id;
 	static const int _profileCategory;
-private:
-	MStatus handle_to_doublearray(MArrayDataHandle&, MDoubleArray&);
+	static MObject cor_valid;
+	static MObject cor_ar;
 
-	virtual MStatus similarity(MDoubleArray&, MDoubleArray&, int, double&);
+private:
+	static MStatus handle_to_doublearray(MArrayDataHandle&, MDoubleArray&);
+
+	static MStatus similarity(MDoubleArray&, MDoubleArray&, int, double&);
 
 	static MStatus qlerp(MQuaternion&, MQuaternion&, MQuaternion&);
 
 	static const double omega;
-
-	virtual bool get_cor_valid();
-
-	virtual void set_cor_valid(bool);
-	
-	bool cor_valid;
-
-	//std::vector<double3> cor_vec;
-
-	MPointArray cor_ar;
-
 };
 
 const MTypeId corSkinCluster::id( 0x22573 );
@@ -66,50 +59,49 @@ const double corSkinCluster::omega(DEFAULT_OMEGA);
 
 const int corSkinCluster::_profileCategory(MProfiler::addCategory(NAME));
 
-MStatus corSkinCluster::qlerp(MQuaternion& q_a, MQuaternion& q_b, MQuaternion& result){
-	MStatus stat;
-	double cross_product;
-	double q_a_comp[4];
-	double q_b_comp[4];
-	stat = q_a.get(q_a_comp);
-	if (stat != MStatus::kSuccess){
-		std::cerr << "corSkinCluster::qlerp, unable to extract q_a" << std::endl;
-		return MStatus::kFailure;
-	}
-	stat = q_b.get(q_b_comp);
-	if (stat != MStatus::kSuccess){
-		std::cerr << "corSkinCluster::qlerp, unable to extract q_b" << std::endl;
-		return MStatus::kFailure;
-	}
-	cross_product = MVector(MPoint(q_a_comp))*MVector(MPoint(q_b_comp));
-	if (cross_product >= 0){
-		result = q_a + q_b;
-	}else{
-		result = q_a - q_b;
-	}
-	return MStatus::kSuccess;
-}
+MObject corSkinCluster::cor_valid;
 
-bool corSkinCluster::get_cor_valid(){
-	return cor_valid;
-}
-
-void corSkinCluster::set_cor_valid(bool state){
-	cor_valid = state;
-}
+MObject corSkinCluster::cor_ar;
 
 void* corSkinCluster::creator()
 {
 	void *node = new corSkinCluster();
-	((corSkinCluster *)node)->set_cor_valid(false);
 	return node;
 }
 
 MStatus corSkinCluster::initialize()
 {
-    return MStatus::kSuccess;
-}
+	MGlobal::startErrorLogging("C:\\\\Users\\iam\\Desktop\\corSkinCluster_init_log");
+	
+	MStatus status = MStatus::kSuccess;
+	
+	MFnNumericAttribute numeric_fn;
+	cor_valid = numeric_fn.create("Valid_Precomputation", "valid", MFnNumericData::kBoolean, 0.0,  &status);
+	if (status != MS::kSuccess){
+		MGlobal::doErrorLogEntry("corSkinCluster:  error setting up valid attr.\n");
+		return status;
+	}
+	addAttribute(cor_valid);
+	attributeAffects(cor_valid, cor_ar);
+	
+	MPointArray temp_ar;
+	MFnPointArrayData fn;
+	MObject default_ar_obj = fn.create(temp_ar); 
 
+	MFnTypedAttribute typed_fn;
+	// cor_ar = typed_fn.create("Centers_of_Rotation", "cor", MFnData::Type::kPointArray, MObject::kNullObj, &status);
+	cor_ar = typed_fn.create("Centers_of_Rotation", "cor", MFnData::Type::kPointArray, default_ar_obj, &status);
+	if (status != MS::kSuccess){
+		MGlobal::doErrorLogEntry("corSkinCluster:  error setting up CoR point array attr.\n");
+		return status;
+	}
+	typed_fn.setWritable(false);
+	addAttribute(cor_ar);
+
+	MGlobal::closeErrorLog();
+
+	return MStatus::kSuccess;
+}
 
 MStatus corSkinCluster::handle_to_doublearray(MArrayDataHandle &handle, MDoubleArray &vec){
 	int count = 0;
@@ -149,30 +141,81 @@ MStatus corSkinCluster::similarity(MDoubleArray &weight_p,
 	return MStatus::kSuccess;
 }
 
+MStatus corSkinCluster::qlerp(MQuaternion& q_a, MQuaternion& q_b, MQuaternion& result){
+	MStatus stat;
+	double cross_product;
+	double q_a_comp[4];
+	double q_b_comp[4];
+	stat = q_a.get(q_a_comp);
+	if (stat != MStatus::kSuccess){
+		std::cerr << "corSkinCluster::qlerp, unable to extract q_a" << std::endl;
+		return MStatus::kFailure;
+	}
+	stat = q_b.get(q_b_comp);
+	if (stat != MStatus::kSuccess){
+		std::cerr << "corSkinCluster::qlerp, unable to extract q_b" << std::endl;
+		return MStatus::kFailure;
+	}
+	cross_product = MVector(MPoint(q_a_comp))*MVector(MPoint(q_b_comp));
+	if (cross_product >= 0){
+		result = q_a + q_b;
+	}else{
+		result = q_a - q_b;
+	}
+	return MStatus::kSuccess;
+}
+
+
 MStatus corSkinCluster::precomp(MDataBlock block)
 {
+	// MGlobal::startErrorLogging("C:\\\\Users\\iam\\Desktop\\corSkinCluster_precomp_log");
 	MStatus stat;
 
-	// make sure the cor array is cleared out
-	cor_ar.clear();
-
-	MItMeshPolygon T(inputGeom, &stat);
-	if (stat == MStatus::kFailure){
-		std::cerr << "corSkinCluster::precomp, unable to get mesh iterator" << std::endl;
+	// load current cor_ar and clear it
+	MDataHandle cor_arHandle = block.inputValue(cor_ar);
+	MFnData::Type test = cor_arHandle.type();
+	MObject cor_arData = cor_arHandle.data();
+	if (cor_arData.hasFn(MFn::Type::kPointArrayData)){
+	}else{
+		return MS::kFailure;
+	}
+	MFnPointArrayData cor_arFn(cor_arData, &stat);
+	if (stat.error()){
+		stat.perror("corSkinCluster::precomp, unable to attached MFnPtAr to cor\n");
 		return stat;
 	}
-	MItGeometry v_i(inputGeom, &stat);
-	if (stat == MStatus::kFailure){
-		std::cerr << "corSkinCluster::precomp, unable to get point iterator" << std::endl;
+	MPointArray cor_PA = cor_arFn.array();
+	cor_PA.clear();
+
+	// get mesh iterator
+	MArrayDataHandle inputHandle = block.inputArrayValue(input);
+	stat = inputHandle.jumpToArrayElement(0);
+	if (stat != MS::kSuccess){
+		return stat;
+	}
+	MDataHandle cor_IOGeoHandle = inputHandle.inputValue().child(inputGeom);
+	MObject cor_IOGeoObj = cor_IOGeoHandle.asMesh();
+	MItMeshPolygon T(cor_IOGeoObj, &stat);
+	if (stat.error()){
+		stat.perror("corSkinCluster::precomp, unable to get mesh iterator\n");
 		return stat;
 	}
 
+	// get vertex iterator
+	MItGeometry v_i(cor_IOGeoHandle, false, &stat);
+	if (stat.error()){
+		stat.perror("corSkinCluster::precomp, unable to get vertex iterator\n");
+		return stat;
+	}
+
+	// weights
 	MArrayDataHandle w_i = block.inputArrayValue(weightList);
 	if ( w_i.elementCount() == 0 ) {
 		// no weights - nothing to do
 		return MStatus::kFailure;
 	}
 
+	// bone transforms
 	MArrayDataHandle transformHandle = block.inputArrayValue(matrix);
 	int num_transforms = transformHandle.elementCount();
 
@@ -199,51 +242,52 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 			for (idx = 0; idx < num_tris; idx++){
 				// get the verts
 				stat = T.getTriangle(idx, tri_verts, tri_idx, MSpace::kObject);
-				if (stat != MStatus::kSuccess){
-					std::cerr << "corSkinCluster::precomp, unable to get triange" << std::endl;
-					return MStatus::kFailure;
+				if (stat.error()){
+					stat.perror("corSkinCluster::precomp, unable to get triangle from iterator\n");
+					return stat;
 				}
 				alpha = tri_verts[0];
 				beta = tri_verts[1];
 				gamma = tri_verts[2];
-				// calc and store area of triange
+				// calc and store area of triangle
 				beta_alpha = MVector(beta-alpha);
 				gamma_alpha = MVector(gamma-alpha);
 				stat = tri_area.append(((beta_alpha ^ gamma_alpha).length())*0.5);
-				if (stat != MStatus::kSuccess){
-					std::cerr << "corskinCluster::precomp, unable to append area" << std::endl;
-					return MStatus::kFailure;
+				if (stat.error()){
+					stat.perror("corskinCluster::precomp, unable to append area\n");
+					return stat;
 				}
 				
 				// calc and store average vertex position
 				stat = tri_avg_pos.append((alpha+beta+gamma)/3);
-				if (stat != MStatus::kSuccess){
-					std::cerr << "corSkinCluster::precomp, unable to apped average position" << std::endl;
+				if (stat.error()){
+					stat.perror("corskinCluster::precomp, unable to apped average position\n");
+					return stat;
 				}
 				
 				// calc and store avg weights
 
 				// get alpha weights
 				stat = w_i.jumpToElement(tri_idx[0]);
-				if (stat = MStatus::kSuccess){
-					std::cerr << "corSkinCluster::precomp, unable to get weights for alpha: " << tri_idx[0] << std::endl;
-					return MStatus::kFailure;
+				if (stat.error()){
+					stat.perror("corSkinCluster::precomp, unable to get weights for alpha.\n");
+					return stat;
 				}
 				MArrayDataHandle alpha_weightsHandle = w_i.inputValue().child(weights);
 
 				// get beta weights
 				stat = w_i.jumpToElement(tri_idx[1]);
-				if (stat != MStatus::kSuccess){
-					std::cerr << "corSkinCluster::precomp, unable to get weights for alpha: " << tri_idx[1] << std::endl;
-					return MStatus::kFailure;
+				if (stat.error()){
+					stat.perror("corSkinCluster::precomp, unable to get weights for beta.\n");
+					return stat;
 				}
 				MArrayDataHandle beta_weightsHandle = w_i.inputValue().child(weights);
 
 				// get gamma weights
 				stat = w_i.jumpToElement(tri_idx[2]);
-				if (stat != MStatus::kSuccess){
-					std::cerr << "corSkinCluster::precomp, unable to get weights for alpha: " << tri_idx[2] << std::endl;
-					return MStatus::kFailure;
+				if (stat.error()){
+					stat.perror("corSkinCluster::precomp, unable to get weights for gamma.\n");
+					return stat;
 				}
 				MArrayDataHandle gamma_weightsHandle = w_i.inputValue().child(weights);
 
@@ -271,15 +315,20 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 					}else{
 						c = 0.0;
 					}
-					tri_avg_weight[i] = (a + b + c)/3.0;
+					stat = tri_avg_weight.append((a + b + c)/3.0);
+					if (stat.error()){
+						stat.perror("corSkinCluster::precomp, unable to add average weight to array.\n");
+						return stat;
+					}
 				} // end for
 				tri_avg_weights.push_back(tri_avg_weight);
 			} // end for
 		}else{ // if num triangles fail
-			std::cerr << "corSkinCluster::precomp, face has no triangles?" << std::endl;
-			return MStatus::kFailure;
+			stat.perror("corSkinCluster::precomp, face has no triangles?\n");
+			return stat;
 		} //end else
-	} // end while
+		T.next();  // next face
+	} // end while, weights averaged, vertex positions averaged
 
 	w_i.jumpToElement(0);
 	v_i.reset();
@@ -315,12 +364,17 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 			lower += s*tri_area[i];
 		}
 		cor = upper/lower;
-		cor_ar.append(cor);
+		cor_PA.append(cor);
 		
 		// iterate the loop
 		v_i.next();
 		w_i.next();
 	} // end while
+
+	// put the computed point array back on the attribute
+	cor_arFn.set(cor_PA);
+
+	MGlobal::closeErrorLog();
 
 	return MStatus::kSuccess;
 }
@@ -342,7 +396,9 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 //
 //
 {
-    MStatus returnStatus;
+	MGlobal::startErrorLogging("C:\\\\Users\\iam\\Desktop\\corSkinCluster_deform_log");
+
+	MStatus returnStatus;
     
 	// get the influence transforms
 	//
@@ -355,9 +411,33 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 	int precomp_event = MProfiler::eventBegin(corSkinCluster::_profileCategory, MProfiler::kColorG_L1, "corSkinCluster: precomp");
 
 	// insert precomp test here
-	if (!get_cor_valid()){
-		precomp(block);
+	MDataHandle validHandle = block.inputValue(cor_valid, &returnStatus);
+	if (returnStatus != MS::kSuccess){
+		MGlobal::doErrorLogEntry("corSkinCluster::deform, unable to get valid handle off datablock\n");
+		return returnStatus;
 	}
+	if (!validHandle.asBool()){
+		returnStatus = precomp(block);
+		if (returnStatus != MS::kSuccess){
+			MGlobal::doErrorLogEntry("corSkinCluster::deform, precomp returned error");
+			return returnStatus;
+		}
+		validHandle.setBool(true);
+	}
+
+	// get the CORs
+	MDataHandle cor_arHandle = block.inputValue(cor_ar, &returnStatus);
+	if (returnStatus != MS::kSuccess){
+		MGlobal::doErrorLogEntry("corSkinCluster::deform, unable to get cor_ar handle off datablock\n");
+		return returnStatus;
+	}
+	MObject cor_arData = cor_arHandle.data();
+	MFnPointArrayData cor_arFn(cor_arData, &returnStatus);
+	if (returnStatus != MS::kSuccess){
+		MGlobal::doErrorLogEntry("corSkinCluster::deform, unable to attach function set for cor ar attr obj\n");
+		return returnStatus;
+	}
+	MPointArray cor_PA = cor_arFn.array();
 
 	MProfiler::eventEnd(precomp_event);
 
@@ -440,7 +520,7 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 
 		MTransformationMatrix R_t_prime_tm(R_t_prime);
 
-		MVector t = (cor_ar[i] * R_t_prime_tm.asRotateMatrix()) - (cor_ar[i] * R);
+		MVector t = (cor_PA[i] * R_t_prime_tm.asRotateMatrix()) - (cor_PA[i] * R);
 		vprime_i = v_i * R + t;
 		iter.setPosition(vprime_i);
 		weightListHandle.next();
@@ -471,7 +551,7 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 	**/
 
 	MProfiler::eventEnd(skin_event);
-
+	MGlobal::closeErrorLog();
     return returnStatus;
 }
 
