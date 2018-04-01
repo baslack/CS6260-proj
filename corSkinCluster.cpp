@@ -131,6 +131,10 @@ MStatus corSkinCluster::similarity(MDoubleArray &weight_p,
 	for (j = 0; j < number_of_transforms; j++){
 		for (k = 0; k < number_of_transforms; k++){
 			if (j != k){
+				auto wpj = weight_p[j];
+				auto wpk = weight_p[k];
+				auto wvj = weight_v[j];
+				auto wvk = weight_v[k];
 				temp = weight_p[j]*weight_p[k]*weight_v[j]*weight_v[k];
 				temp *= exp(-(pow(((weight_p[j]*weight_v[k]-weight_p[k]*weight_v[j])/pow(omega,2.0)),2.0)));
 				result += temp;
@@ -292,6 +296,7 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 				MArrayDataHandle gamma_weightsHandle = w_i.inputValue().child(weights);
 
 				double a, b, c;
+				tri_avg_weight.clear();
 				for (int i = 0; i < num_transforms; i++){
 					// average and store weights
 					// get ith weight for alpha
@@ -344,13 +349,14 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 		// calculate the COR
 
 		// get the vertex weights in a double array
+		vertex_weights.clear();
 		MArrayDataHandle vertex_weights_handle = w_i.inputValue().child(weights);
 		for (int i = 0; i < num_transforms; i++){
 			stat = vertex_weights_handle.jumpToElement(i);
-			if (stat != MStatus::kSuccess){
-				vertex_weights[i] = 0.0;
+			if (stat.error()){
+				vertex_weights.append(0.0);
 			}else{
-				vertex_weights[i] = vertex_weights_handle.inputValue().asDouble();
+				vertex_weights.append(vertex_weights_handle.inputValue().asDouble());
 			}
 		}
 
@@ -363,7 +369,11 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 			upper += tri_avg_pos[i]*s*tri_area[i];
 			lower += s*tri_area[i];
 		}
-		cor = upper/lower;
+		if (lower > 0){
+			cor = upper/lower;
+		}else{
+			cor = MPoint(0.0,0.0,0.0);
+		}
 		cor_PA.append(cor);
 		
 		// iterate the loop
@@ -457,12 +467,10 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 
 	// get the unit quaternions for the rotations of the matricies
 	std::vector<MQuaternion> q_j;
-	MQuaternion q;
-	MQuaternion &rq = q;
 	for (int j=0; j<numTransforms; ++j ) {
-		const MMatrix &temp = transforms[j];
-		rq = temp;
-		q_j[j] = rq;
+		MTransformationMatrix temp_tm(transforms[j]);
+		MQuaternion q = temp_tm.rotation();
+		q_j.push_back(q);
 	}
 
 	MArrayDataHandle weightListHandle = block.inputArrayValue( weightList );
@@ -480,47 +488,48 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 		MPoint v_i = iter.position();
 		MPoint vprime_i;
 
-		MArrayDataHandle weightHandle = weightListHandle.inputValue().child(weights);
+		MArrayDataHandle weightsHandle = weightListHandle.inputValue().child(weights);
 
 		MQuaternion q(0.0,0.0,0.0,0.0);
 		MQuaternion result;
 		double w_j;
 
+		// find weighted q for v_i
 		for (int j = 0; j < numTransforms;  j++){
 			MStatus stat;
-			stat = weightHandle.jumpToElement(j);
+			stat = weightsHandle.jumpToElement(j);
 			if (stat == MStatus::kSuccess){
-				w_j = weightHandle.inputValue().asDouble();
+				w_j = weightsHandle.inputValue().asDouble();
 			}else{
 				w_j = 0.0;
 			}
-			stat = qlerp(q,q_j[j], q);
+			stat = qlerp(q,w_j*q_j[j], q);
 		}
 
 		q.normalizeIt();
 		MMatrix R = q.asMatrix();
 
 		//LBS Matrix
-		MMatrix R_t_prime = MMatrix();
+		MMatrix R_t_prime = MMatrix::identity;  // init to identity
 		for (int j = 0; j < numTransforms; j++){
+			MTransformationMatrix temp = MTransformationMatrix::identity;
 			MTransformationMatrix tm(transforms[j]);
-			MVector translate = tm.getTranslation(MSpace::kObject);
-			MTransformationMatrix R_t = tm.asRotateMatrix();
-			R_t.setTranslation(translate, MSpace::kObject);
-			MMatrix temp = R_t.asMatrix();
+			temp.rotateTo(tm.rotation());
+			temp.setTranslation(tm.getTranslation(MSpace::kWorld, NULL), MSpace::kWorld);
+			
 			MStatus stat;
-			stat = weightHandle.jumpToElement(j);
+			stat = weightsHandle.jumpToElement(j);
 			if (stat == MStatus::kSuccess){
-				w_j = weightHandle.inputValue().asDouble();
+				w_j = weightsHandle.inputValue().asDouble();
 			}else{
 				w_j = 0.0;
 			}
-			R_t_prime *= (temp * w_j);
+			R_t_prime += (w_j * temp.asMatrix());
 		}
 
 		MTransformationMatrix R_t_prime_tm(R_t_prime);
 
-		MVector t = (cor_PA[i] * R_t_prime_tm.asRotateMatrix()) - (cor_PA[i] * R);
+		MVector t = (cor_PA[i] * R_t_prime_tm.asRotateMatrix()) + R_t_prime_tm.getTranslation(MSpace::kWorld, NULL) - (cor_PA[i] * R);
 		vprime_i = v_i * R + t;
 		iter.setPosition(vprime_i);
 		weightListHandle.next();
