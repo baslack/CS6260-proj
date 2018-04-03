@@ -81,8 +81,8 @@ MStatus corSkinCluster::initialize()
 		MGlobal::doErrorLogEntry("corSkinCluster:  error setting up valid attr.\n");
 		return status;
 	}
+	numeric_fn.setStorable(true);
 	addAttribute(cor_valid);
-	attributeAffects(cor_valid, cor_ar);
 	
 	MPointArray temp_ar;
 	MFnPointArrayData fn;
@@ -95,7 +95,7 @@ MStatus corSkinCluster::initialize()
 		MGlobal::doErrorLogEntry("corSkinCluster:  error setting up CoR point array attr.\n");
 		return status;
 	}
-	typed_fn.setWritable(false);
+	numeric_fn.setStorable(true);
 	addAttribute(cor_ar);
 
 	MGlobal::closeErrorLog();
@@ -135,8 +135,8 @@ MStatus corSkinCluster::similarity(MDoubleArray &weight_p,
 				auto wpk = weight_p[k];
 				auto wvj = weight_v[j];
 				auto wvk = weight_v[k];
-				temp = weight_p[j]*weight_p[k]*weight_v[j]*weight_v[k];
-				temp *= exp(-(pow(((weight_p[j]*weight_v[k]-weight_p[k]*weight_v[j])/pow(omega,2.0)),2.0)));
+				temp = wpj*wpk*wvj*wvk;
+				temp *= exp(-(pow(wpj*wvk-wpk*wvj,2.0)/pow(omega,2.0)));
 				result += temp;
 			}
 		}  // end k loop
@@ -240,12 +240,15 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 	
 	// pre calc all the areas, average weights and positions
 	while(!(T.isDone())){
+		// each hit on the iterator returns a face
+		// that face is made of multiple triangles
+		// how many?
 		stat = T.numTriangles(num_tris);
 		if (stat == MStatus::kSuccess){
 			// for each triangle
 			for (idx = 0; idx < num_tris; idx++){
 				// get the verts
-				stat = T.getTriangle(idx, tri_verts, tri_idx, MSpace::kObject);
+				stat = T.getTriangle(idx, tri_verts, tri_idx, MSpace::kObject);  // switched this to world, from kObject
 				if (stat.error()){
 					stat.perror("corSkinCluster::precomp, unable to get triangle from iterator\n");
 					return stat;
@@ -360,11 +363,11 @@ MStatus corSkinCluster::precomp(MDataBlock block)
 			}
 		}
 
+		s = 0.0;
+		upper = MPoint(0.0,0.0,0.0);
+		lower = 0.0;
 		// for each triangle
 		for (int i = 0; i < num_tris; i++){
-			s = 0.0;
-			upper = MPoint(0.0,0.0,0.0);
-			lower = 0.0;
 			stat = similarity(vertex_weights, tri_avg_weights[i], num_transforms, s);
 			upper += tri_avg_pos[i]*s*tri_area[i];
 			lower += s*tri_area[i];
@@ -506,16 +509,15 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 			stat = qlerp(q,w_j*q_j[j], q);
 		}
 
-		q.normalizeIt();
+		q = q.normalizeIt();
 		MMatrix R = q.asMatrix();
 
 		//LBS Matrix
 		MMatrix R_t_prime = MMatrix::identity;  // init to identity
 		for (int j = 0; j < numTransforms; j++){
-			MTransformationMatrix temp = MTransformationMatrix::identity;
-			MTransformationMatrix tm(transforms[j]);
-			temp.rotateTo(tm.rotation());
-			temp.setTranslation(tm.getTranslation(MSpace::kWorld, NULL), MSpace::kWorld);
+			MTransformationMatrix tm(transforms[j]); 
+			MTransformationMatrix temp = tm.asRotateMatrix();
+			temp.setTranslation(tm.getTranslation(MSpace::kWorld, NULL), MSpace::kWorld);  // switched from kWorld
 			
 			MStatus stat;
 			stat = weightsHandle.jumpToElement(j);
@@ -524,12 +526,16 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 			}else{
 				w_j = 0.0;
 			}
-			R_t_prime += (w_j * temp.asMatrix());
+			if (j == 0){
+				R_t_prime = w_j*temp.asMatrix();
+			}else{
+				R_t_prime += (w_j * temp.asMatrix());
+			}
 		}
 
 		MTransformationMatrix R_t_prime_tm(R_t_prime);
 
-		MVector t = (cor_PA[i] * R_t_prime_tm.asRotateMatrix()) + R_t_prime_tm.getTranslation(MSpace::kWorld, NULL) - (cor_PA[i] * R);
+		MVector t = (cor_PA[i] * R_t_prime_tm.asRotateMatrix()) + R_t_prime_tm.getTranslation(MSpace::kWorld, NULL) - (cor_PA[i] * R);  // switch from kWorld
 		vprime_i = v_i * R + t;
 		iter.setPosition(vprime_i);
 		weightListHandle.next();
