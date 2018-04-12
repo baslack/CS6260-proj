@@ -17,6 +17,16 @@
 #include <maya/MGlobal.h>
 #include <maya/MFnPointArrayData.h>
 
+#include <maya/MPxGPUDeformer.h>
+#include <maya/MPxGPUDeformer.h>
+#include <maya/MEvaluationNode.h>
+#include <maya/MGPUDeformerRegistry.h>
+#include <maya/MOpenCLInfo.h>
+#include <maya/MViewport2Renderer.h>
+#include <clew/clew_cl.h>
+#include <CL/cl.h>
+#include <maya/MPxDeformerNode.h>
+
 #include <vector>
 
 //my additions
@@ -52,6 +62,17 @@ private:
 
 	static const double omega;
 };
+
+class parallel_corSkinCluster : public corSkinCluster
+{
+public:
+	virtual MStatus deform(MDataBlock    &block,
+                           MItGeometry   &iter,
+                           const MMatrix &mat,
+                           unsigned int   multiIndex);
+};
+
+// const MTypeId parallel_corSkinCluster::id (0x0122573);
 
 const MTypeId corSkinCluster::id( 0x22573 );
 
@@ -89,7 +110,6 @@ MStatus corSkinCluster::initialize()
 	MObject default_ar_obj = fn.create(temp_ar); 
 
 	MFnTypedAttribute typed_fn;
-	// cor_ar = typed_fn.create("Centers_of_Rotation", "cor", MFnData::Type::kPointArray, MObject::kNullObj, &status);
 	cor_ar = typed_fn.create("Centers_of_Rotation", "cor", MFnData::Type::kPointArray, default_ar_obj, &status);
 	if (status != MS::kSuccess){
 		MGlobal::doErrorLogEntry("corSkinCluster:  error setting up CoR point array attr.\n");
@@ -147,7 +167,7 @@ MStatus corSkinCluster::similarity(MDoubleArray &weight_p,
 
 MStatus corSkinCluster::qlerp(MQuaternion& q_a, MQuaternion& q_b, MQuaternion& result){
 	MStatus stat;
-	double cross_product;
+	double dot_product;
 	double q_a_comp[4];
 	double q_b_comp[4];
 	stat = q_a.get(q_a_comp);
@@ -160,8 +180,11 @@ MStatus corSkinCluster::qlerp(MQuaternion& q_a, MQuaternion& q_b, MQuaternion& r
 		std::cerr << "corSkinCluster::qlerp, unable to extract q_b" << std::endl;
 		return MStatus::kFailure;
 	}
-	cross_product = MVector(MPoint(q_a_comp))*MVector(MPoint(q_b_comp));
-	if (cross_product >= 0){
+	dot_product = 0.0;
+	for (int i = 0; i < 4; i++){
+		dot_product += q_a_comp[i]*q_b_comp[i];
+	}
+	if (dot_product >= 0){
 		result = q_a + q_b;
 	}else{
 		result = q_a - q_b;
@@ -472,7 +495,7 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 	std::vector<MQuaternion> q_j;
 	for (int j=0; j<numTransforms; ++j ) {
 		MTransformationMatrix temp_tm(transforms[j]);
-		MQuaternion q = temp_tm.rotation();
+		MQuaternion q = temp_tm.rotation().normalizeIt();
 		q_j.push_back(q);
 	}
 
@@ -506,6 +529,8 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 			}else{
 				w_j = 0.0;
 			}
+			double q_comp[4];
+			q_j[j].get(q_comp);
 			stat = qlerp(q,w_j*q_j[j], q);
 		}
 
@@ -568,6 +593,406 @@ MStatus corSkinCluster::deform( MDataBlock& block,
 	MProfiler::eventEnd(skin_event);
 	MGlobal::closeErrorLog();
     return returnStatus;
+}
+
+
+
+// GPU Override
+
+class corSkinGPUDeformer : public MPxGPUDeformer
+{
+public:
+    // Virtual methods from MPxGPUDeformer
+    corSkinGPUDeformer();
+    virtual ~corSkinGPUDeformer();
+    
+    virtual MPxGPUDeformer::DeformerStatus evaluate(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, unsigned int numElements, const MAutoCLMem, const MAutoCLEvent, MAutoCLMem, MAutoCLEvent&);
+    virtual void terminate();
+    static MGPUDeformerRegistrationInfo* getGPUDeformerInfo();
+    static bool validateNodeInGraph(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, MStringArray* messages);
+    static bool validateNodeValues(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, MStringArray* messages);
+private:
+    // helper methods
+    void extractWeightArray(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
+    void extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
+	void extractTMnQ(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
+    // Storage for data on the GPU
+    MAutoCLMem fCLWeights;
+    MAutoCLMem fCoR;
+	MAutoCLMem fTM;
+	MAutoCLMem fQ;
+	unsigned int fNumTransforms;
+    unsigned int fNumElements;
+    // Kernel
+    MAutoCLKernel fKernel;
+};
+
+class corSkinNodeGPUDeformerInfo : public MGPUDeformerRegistrationInfo
+{
+public:
+    corSkinNodeGPUDeformerInfo(){}
+    virtual ~corSkinNodeGPUDeformerInfo(){}
+    virtual MPxGPUDeformer* createGPUDeformer()
+    {
+        return new corSkinGPUDeformer();
+    }
+    
+    virtual bool validateNodeInGraph(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug, MStringArray* messages)
+    {
+        return corSkinGPUDeformer::validateNodeInGraph(block, evaluationNode, plug, messages);
+    }
+    virtual bool validateNodeValues(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug, MStringArray* messages)
+    {
+        return corSkinGPUDeformer::validateNodeValues(block, evaluationNode, plug, messages);
+    }
+};
+
+MGPUDeformerRegistrationInfo* corSkinGPUDeformer::getGPUDeformerInfo()
+{
+    static corSkinNodeGPUDeformerInfo theOne;
+    return &theOne;
+}
+
+corSkinGPUDeformer::corSkinGPUDeformer()
+{
+}
+
+corSkinGPUDeformer::~corSkinGPUDeformer()
+{
+    terminate();
+}
+
+// static
+bool corSkinGPUDeformer::validateNodeInGraph(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug, MStringArray* messages)
+{
+    return true;
+}
+
+// static
+bool corSkinGPUDeformer::validateNodeValues(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug, MStringArray* messages)
+{   
+    MObject node = plug.node();
+    MFnDependencyNode fnNode(node);
+ 	MPlug validPlug(node, corSkinCluster::cor_valid);
+    MDataHandle validData;
+    validPlug.getValue(validData);
+	if (!validData.asBool())
+    {
+        MOpenCLInfo::appendMessage(messages, "corSKin %s not supported by deformer evaluator because precomputation is invalid.", fnNode.name().asChar());
+        return false;
+    }
+    return true;
+}
+
+MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
+    MDataBlock& block,                          // data block for "this" node
+    const MEvaluationNode& evaluationNode,      // evaluation node representing "this" node
+    const MPlug& plug,                          // the multi index we're working on.  There will be a separate instance created per multi index
+    unsigned int numElements,                   // the number of float3 elements in inputBuffer and outputBuffer
+    const MAutoCLMem inputBuffer,               // the input positions we are going to deform
+    const MAutoCLEvent inputEvent,              // the input event we need to wait for before we start reading the input positions
+    MAutoCLMem outputBuffer,                    // the output positions we should write to.  This may or may not be the same buffer as inputBuffer.
+    MAutoCLEvent& outputEvent)                  // the event a downstream deformer will wait for before reading from output buffer
+{
+    // evaluate has two main pieces of work.  I need to transfer any data I care about onto the GPU, and I need to run my OpenCL Kernel.
+    // First, transfer the data.  offset has two pieces of data I need to transfer to the GPU, the weight array and the offset matrix.
+    // I don't need to transfer down the input position buffer, that is already handled by the deformer evaluator, the points are in inputBuffer.
+    fNumElements = numElements;
+    MObject node = plug.node();
+    extractWeightArray(block, evaluationNode, plug);
+    extractCoR(block, evaluationNode, plug);
+	extractTMnQ(block, evaluationNode, plug);
+    // Now that all the data we care about is on the GPU, setup and run the OpenCL Kernel
+    if (!fKernel.get())
+    {
+        // char *maya_location = getenv( "MAYA_LOCATION" );
+        // MString openCLKernelFile(maya_location);
+        // openCLKernelFile +="/../Extra/devkitBase/devkit/plug-ins/offsetNode/offset.cl";
+        MString openCLKernelFile("C:\\Users\\iam\\Documents\\maya\\2017\\plug-ins\\corSkin.cl");
+		MString openCLKernelName("corSkin");
+        fKernel = MOpenCLInfo::getOpenCLKernel(openCLKernelFile, openCLKernelName);
+        if (!fKernel) return MPxGPUDeformer::kDeformerFailure;
+    }
+    cl_int err = CL_SUCCESS;
+    
+    // Set all of our kernel parameters.  Input buffer and output buffer may be changing every frame
+    // so always set them.
+    unsigned int parameterId = 0;
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)outputBuffer.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)inputBuffer.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fCLWeights.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fCoR.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+	err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fTM.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fQ.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
+    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_uint), (void*)&fNumElements);
+    MOpenCLInfo::checkCLErrorStatus(err);
+
+    // Figure out a good work group size for our kernel.
+    size_t workGroupSize;
+    size_t retSize;
+    err = clGetKernelWorkGroupInfo(
+        fKernel.get(),
+        MOpenCLInfo::getOpenCLDeviceId(),
+        CL_KERNEL_WORK_GROUP_SIZE,
+        sizeof(size_t),
+        &workGroupSize,
+        &retSize);
+    MOpenCLInfo::checkCLErrorStatus(err);
+    size_t localWorkSize = 256;
+    if (retSize > 0) localWorkSize = workGroupSize;
+    size_t globalWorkSize = (localWorkSize - fNumElements % localWorkSize) + fNumElements; // global work size must be a multiple of localWorkSize
+    // set up our input events.  The input event could be NULL, in that case we need to pass
+    // slightly different parameters into clEnqueueNDRangeKernel
+    unsigned int numInputEvents = 0;
+    if (inputEvent.get())
+    {
+        numInputEvents = 1;
+    }
+    // run the kernel
+    err = clEnqueueNDRangeKernel(
+        MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(),
+        fKernel.get(),
+        1,
+        NULL,
+        &globalWorkSize,
+        &localWorkSize,
+        numInputEvents,
+        numInputEvents ? inputEvent.getReadOnlyRef() : 0,
+        outputEvent.getReferenceForAssignment() );
+    MOpenCLInfo::checkCLErrorStatus(err);
+    return MPxGPUDeformer::kDeformerSuccess;
+}
+
+void corSkinGPUDeformer::terminate()
+{
+    MHWRender::MRenderer::theRenderer()->releaseGPUMemory(fNumElements*sizeof(float));
+    fCLWeights.reset();
+    fCoR.reset();
+	fTM.reset();
+	fQ.reset();
+    MOpenCLInfo::releaseOpenCLKernel(fKernel);
+    fKernel.reset();
+}
+
+void corSkinGPUDeformer::extractWeightArray(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
+{
+    // if we've already got a weight array and it is not changing then don't bother copying it
+    // to the GPU again
+    MStatus status;
+    // Note that right now dirtyPlugExists takes an attribute, so if any element in the multi is changing we think it is dirty...
+    // To avoid false dirty issues here you'd need to only use one element of the MPxDeformerNode::input multi attribute for each
+    // offset node.
+	if ((fCLWeights.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::weightList, &status)) || !status)
+    {
+        return;
+    }
+
+	// what do we need to do
+	// get the weight list
+	// for each element of the weight list, push each of the weights
+
+	std::vector<float> temp;
+
+	MArrayDataHandle transformsHandle = block.inputArrayValue( corSkinCluster::matrix );
+	int numTransforms = transformsHandle.elementCount();
+	if ( numTransforms == 0 ) return;
+
+	MStatus stat;
+	MArrayDataHandle weightListHandle = block.inputArrayValue(corSkinCluster::weightList, &stat);
+	if (stat.error()) return;
+	for (unsigned int i = 0; i < fNumElements; i++){
+		MArrayDataHandle weightsHandle = weightListHandle.inputValue().child(corSkinCluster::weights);
+		for(int j = 0; j < numTransforms; j ++){
+			stat = weightsHandle.jumpToElement(j);
+			if (stat.error()){
+				temp.push_back(0.0);
+			}else{
+				temp.push_back(weightsHandle.inputValue().asFloat());
+			}
+		}
+		weightListHandle.next();
+	}
+
+	// weights all in temp
+	
+    // Two possibilities, we could be updating an existing OpenCL buffer or allocating a new one.
+    cl_int err = CL_SUCCESS;
+    if (!fCLWeights.get())
+    {
+        MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements*numTransforms*sizeof(float));
+        fCLWeights.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, fNumElements * numTransforms * sizeof(float), (void*)&temp[0], &err));
+    }
+    else
+    {
+        // I use a blocking write here, non-blocking could be faster...  need to manage the lifetime of temp, and have the kernel wait until the write finishes before running
+        // I'm also assuming that the weight buffer is not growing.
+        err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fCLWeights.get(), CL_TRUE, 0, fNumElements * numTransforms * sizeof(float), (void*)&temp[0], 0, NULL, NULL);
+    }
+}
+
+void corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
+{
+	// get CoRs
+	MStatus stat;
+
+	// check for existing CoR in buffer
+	/*
+	if ((fCoR.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::cor_ar, &stat)) || !stat)
+    {
+        return;
+    }
+	*/
+
+	MDataHandle cor_arHandle = block.inputValue(corSkinCluster::cor_ar, &stat);
+	if (stat!= MS::kSuccess){
+		return;
+	}
+	MObject cor_arData = cor_arHandle.data();
+	MFnPointArrayData cor_arFn(cor_arData, &stat);
+	if (stat!= MS::kSuccess){
+		return;
+	}
+	MPointArray cor_PA = cor_arFn.array();
+
+	std::vector<float>temp;
+
+	for (unsigned int i = 0; i < cor_PA.length(); i++){
+		temp.push_back((float)cor_PA[i].x);
+		temp.push_back((float)cor_PA[i].y);
+		temp.push_back((float)cor_PA[i].z);
+		temp.push_back((float)cor_PA[i].w);
+	}
+
+	// all CoR in temp
+
+	cl_int err = CL_SUCCESS;
+    if (!fCLWeights.get())
+    {
+        MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements * 4 * sizeof(float));
+        fCLWeights.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, fNumElements * 4 * sizeof(float), (void*)&temp[0], &err));
+    }
+    else
+    {
+        // I use a blocking write here, non-blocking could be faster...  need to manage the lifetime of temp, and have the kernel wait until the write finishes before running
+        // I'm also assuming that the weight buffer is not growing.
+        err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fCLWeights.get(), CL_TRUE, 0, fNumElements * 4 * sizeof(float), (void*)&temp[0], 0, NULL, NULL);
+    }
+}
+
+void corSkinGPUDeformer::extractTMnQ(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
+{	
+	// I pass the offset matrix to OpenCL using a buffer as well.  I also send down the inverse matrix to avoid calculating it many times on the GPU
+	MStatus status;
+	if ((fTM.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::matrix , &status)) || !status)
+	{
+		return;
+	}
+
+	MArrayDataHandle transformsHandle = block.inputArrayValue( corSkinCluster::matrix );
+	int numTransforms = transformsHandle.elementCount();
+	if ( numTransforms == 0 ) {
+		return;
+	}
+	
+	MMatrixArray transforms;
+	for ( int i=0; i<numTransforms; ++i ) {
+		transforms.append( MFnMatrixData( transformsHandle.inputValue().data() ).matrix() );
+		transformsHandle.next();
+	}
+
+	MArrayDataHandle bindHandle = block.inputArrayValue( corSkinCluster::bindPreMatrix );
+	if ( bindHandle.elementCount() > 0 ) {
+		for ( int i=0; i<numTransforms; ++i ) {
+			transforms[i] = MFnMatrixData( bindHandle.inputValue().data() ).matrix() * transforms[i];
+			bindHandle.next();
+		}
+	}
+
+	// openCL needs matrices in transpose orientation
+	// we also need to split off the scaling and shearing
+	// as that the algorithm doesn't use that as of yet
+
+	MMatrixArray transforms_transpose;
+	MMatrix temp;
+	MVector temp_trans;
+	MTransformationMatrix temp_tm;
+	for (int i = 0; i < numTransforms; i++){
+		temp_tm = MTransformationMatrix(transforms[i]);
+		temp_trans = temp_tm.getTranslation(MSpace::kWorld);
+		temp = temp_tm.asRotateMatrix();
+		temp_tm = MTransformationMatrix(temp);
+		temp_tm.setTranslation(temp_trans, MSpace::kWorld);
+		temp = temp_tm.asMatrix();
+		temp = temp.transpose();
+		transforms_transpose.append(temp);
+	}
+
+	// now we need to pack those transforms up into something
+	// openCL can understand, i.e. and array of floats
+
+	std::vector<float> conv_transforms;
+	for ( int i = 0; i < numTransforms; i++){
+		for ( int r = 0; r < 4; r++){
+			for ( int c = 0; c < 4; c++){
+				conv_transforms.push_back((float)transforms_transpose[i](r,c));
+			}
+		}
+	}
+
+	// now we prep that group for openCL
+	cl_int err = CL_SUCCESS;
+	if (!fTM.get())
+	{
+		fTM.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, conv_transforms.size() * sizeof(float), (void*)&conv_transforms[0], &err));
+	}
+	else
+	{
+		// I use a blocking write here, non-blocking could be faster...  need to manage the lifetime of temp, and have the kernel wait until the write finishes before running
+		err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fTM.get(), CL_TRUE, 0, conv_transforms.size() * sizeof(float), (void*)&conv_transforms[0], 0, NULL, NULL);
+	}
+
+	// now, as that we already have the transforms here, 
+	// let's get the quaternions while we're at it
+
+	// get the unit quaternions for the rotations of the matricies
+	std::vector<MQuaternion> q_j;
+	for (int j=0; j<numTransforms; ++j ) {
+		MTransformationMatrix temp_tm(transforms[j]);
+		MQuaternion q = temp_tm.rotation().normalizeIt();
+		q_j.push_back(q);
+	}
+
+	// now that we have the unit quaternions we need
+	// to back them up in a fashion that openCL can handle them
+
+	std::vector<float>conv_q;
+
+	for (int j = 0; j < numTransforms;  ++j){
+		conv_q.push_back((float)q_j[j].x);
+		conv_q.push_back((float)q_j[j].y);
+		conv_q.push_back((float)q_j[j].z);
+		conv_q.push_back((float)q_j[j].w);
+	}
+
+	// pipe them to the device
+	cl_int err = CL_SUCCESS;
+	if (!fQ.get())
+	{
+		fQ.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, conv_q.size() * sizeof(float), (void*)&conv_q[0], &err));
+	}
+	else
+	{
+		// I use a blocking write here, non-blocking could be faster...  need to manage the lifetime of temp, and have the kernel wait until the write finishes before running
+		err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fQ.get(), CL_TRUE, 0, conv_q.size() * sizeof(float), (void*)&conv_q[0], 0, NULL, NULL);
+	}
+
+	fNumTransforms = (unsigned int)numTransforms;
 }
 
 
