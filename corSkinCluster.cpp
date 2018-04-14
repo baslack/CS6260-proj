@@ -614,7 +614,7 @@ public:
 private:
     // helper methods
     void extractWeightArray(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
-    void extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
+    MStatus extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
 	void extractTMnQ(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
     // Storage for data on the GPU
     MAutoCLMem fCLWeights;
@@ -700,7 +700,14 @@ MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
     fNumElements = numElements;
     MObject node = plug.node();
     extractWeightArray(block, evaluationNode, plug);
-    extractCoR(block, evaluationNode, plug);
+	
+	MStatus stat;
+	stat = extractCoR(block, evaluationNode, plug);
+	// something went wrong getting the CoRs
+
+	if (stat.error()){
+		return MPxGPUDeformer::kDeformerFailure;
+	}
 	extractTMnQ(block, evaluationNode, plug);
     // Now that all the data we care about is on the GPU, setup and run the OpenCL Kernel
     if (!fKernel.get())
@@ -708,8 +715,8 @@ MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
         // char *maya_location = getenv( "MAYA_LOCATION" );
         // MString openCLKernelFile(maya_location);
         // openCLKernelFile +="/../Extra/devkitBase/devkit/plug-ins/offsetNode/offset.cl";
-        MString openCLKernelFile("C:\\Users\\iam\\Documents\\maya\\2017\\plug-ins\\corSkin.cl");
-		MString openCLKernelName("corSkin");
+        MString openCLKernelFile("C:\\Users\\iam\\Documents\\maya\\2017\\plug-ins\\corSkinDef.cl");
+		MString openCLKernelName("corSkinDef");
         fKernel = MOpenCLInfo::getOpenCLKernel(openCLKernelFile, openCLKernelName);
         if (!fKernel) return MPxGPUDeformer::kDeformerFailure;
     }
@@ -724,13 +731,15 @@ MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
     MOpenCLInfo::checkCLErrorStatus(err);
     err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fCLWeights.getReadOnlyRef());
     MOpenCLInfo::checkCLErrorStatus(err);
-    err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fCoR.getReadOnlyRef());
-    MOpenCLInfo::checkCLErrorStatus(err);
 	err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fTM.getReadOnlyRef());
     MOpenCLInfo::checkCLErrorStatus(err);
     err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fQ.getReadOnlyRef());
     MOpenCLInfo::checkCLErrorStatus(err);
+	err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_mem), (void*)fCoR.getReadOnlyRef());
+    MOpenCLInfo::checkCLErrorStatus(err);
     err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_uint), (void*)&fNumElements);
+    MOpenCLInfo::checkCLErrorStatus(err);
+	err = clSetKernelArg(fKernel.get(), parameterId++, sizeof(cl_uint), (void*)&fNumTransforms);
     MOpenCLInfo::checkCLErrorStatus(err);
 
     // Figure out a good work group size for our kernel.
@@ -836,27 +845,37 @@ void corSkinGPUDeformer::extractWeightArray(MDataBlock& block, const MEvaluation
     }
 }
 
-void corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
+MStatus corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
 {
 	// get CoRs
 	MStatus stat;
 
 	// check for existing CoR in buffer
-	/*
-	if ((fCoR.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::cor_ar, &stat)) || !stat)
-    {
-        return;
-    }
-	*/
+	// orig test
+	// if ((fCoR.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::cor_ar, &stat)) || !stat)
+	
+	// get the valid attr
+	MDataHandle valid_handle = block.inputValue(corSkinCluster::cor_valid, &stat);
+	if (stat.error()){
+		return stat;
+	}
+	bool bValid = valid_handle.asBool();
 
+	// if the CoRs are valid and on the GPU there's nothing to do
+	if (fCoR.get() && bValid)
+    {
+		return MS::kSuccess;
+    }
+
+	// if they're not, pull them off
 	MDataHandle cor_arHandle = block.inputValue(corSkinCluster::cor_ar, &stat);
 	if (stat!= MS::kSuccess){
-		return;
+		return stat;
 	}
 	MObject cor_arData = cor_arHandle.data();
 	MFnPointArrayData cor_arFn(cor_arData, &stat);
 	if (stat!= MS::kSuccess){
-		return;
+		return stat;
 	}
 	MPointArray cor_PA = cor_arFn.array();
 
@@ -883,6 +902,8 @@ void corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode& ev
         // I'm also assuming that the weight buffer is not growing.
         err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fCLWeights.get(), CL_TRUE, 0, fNumElements * 4 * sizeof(float), (void*)&temp[0], 0, NULL, NULL);
     }
+
+	return MStatus::kSuccess;
 }
 
 void corSkinGPUDeformer::extractTMnQ(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug)
@@ -981,7 +1002,7 @@ void corSkinGPUDeformer::extractTMnQ(MDataBlock& block, const MEvaluationNode& e
 	}
 
 	// pipe them to the device
-	cl_int err = CL_SUCCESS;
+	err = CL_SUCCESS;
 	if (!fQ.get())
 	{
 		fQ.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, conv_q.size() * sizeof(float), (void*)&conv_q[0], &err));
@@ -1003,7 +1024,7 @@ MStatus initializePlugin( MObject obj )
 {
     MStatus result;
 
-    MFnPlugin plugin( obj, "Benjamin Slack", "0.0", "Any");
+    MFnPlugin plugin( obj, "Benjamin Slack", "0.1", "Any");
     result = plugin.registerNode(
         "corSkinCluster" ,
         corSkinCluster::id ,
@@ -1011,6 +1032,18 @@ MStatus initializePlugin( MObject obj )
         &corSkinCluster::initialize ,
         MPxNode::kSkinCluster
         );
+
+	MString nodeClassName("corSkinCluster");
+	MString registrantId("Benjamin_Slack");
+	MGPUDeformerRegistry::registerGPUDeformerCreator(
+		nodeClassName,
+		registrantId,
+		corSkinGPUDeformer::getGPUDeformerInfo());
+	
+	MGPUDeformerRegistry::addConditionalAttribute(
+		nodeClassName,
+		registrantId,
+		corSkinCluster::cor_valid);
 
     return result;
 }
@@ -1022,5 +1055,27 @@ MStatus uninitializePlugin( MObject obj )
     MFnPlugin plugin( obj );
     result = plugin.deregisterNode( corSkinCluster::id );
 
+	MString nodeClassName("corSkinCluster");
+	MString registrantId("Benjamin_Slack");
+	MGPUDeformerRegistry::deregisterGPUDeformerCreator(
+		nodeClassName,
+		registrantId);
+
     return result;
 }
+
+//
+//MStatus uninitializePlugin( MObject obj)
+//{
+//	MStatus result;
+//	MFnPlugin plugin( obj );
+//	result = plugin.deregisterNode( offset::id );
+//
+//	MString nodeClassName("offset");
+//	MString registrantId("mayaPluginExample");
+//	MGPUDeformerRegistry::deregisterGPUDeformerCreator(
+//		nodeClassName,
+//		registrantId);
+//
+//	return result;
+//}
