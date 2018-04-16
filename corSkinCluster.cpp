@@ -26,6 +26,7 @@
 #include <clew/clew_cl.h>
 #include <CL/cl.h>
 #include <maya/MPxDeformerNode.h>
+#include <maya/MString.h>
 
 #include <vector>
 
@@ -63,14 +64,14 @@ private:
 	static const double omega;
 };
 
-class parallel_corSkinCluster : public corSkinCluster
-{
-public:
-	virtual MStatus deform(MDataBlock    &block,
-                           MItGeometry   &iter,
-                           const MMatrix &mat,
-                           unsigned int   multiIndex);
-};
+//class parallel_corSkinCluster : public corSkinCluster
+//{
+//public:
+//	virtual MStatus deform(MDataBlock    &block,
+//                           MItGeometry   &iter,
+//                           const MMatrix &mat,
+//                           unsigned int   multiIndex);
+//};
 
 // const MTypeId parallel_corSkinCluster::id (0x0122573);
 
@@ -605,12 +606,13 @@ public:
     // Virtual methods from MPxGPUDeformer
     corSkinGPUDeformer();
     virtual ~corSkinGPUDeformer();
-    
     virtual MPxGPUDeformer::DeformerStatus evaluate(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, unsigned int numElements, const MAutoCLMem, const MAutoCLEvent, MAutoCLMem, MAutoCLEvent&);
     virtual void terminate();
     static MGPUDeformerRegistrationInfo* getGPUDeformerInfo();
     static bool validateNodeInGraph(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, MStringArray* messages);
     static bool validateNodeValues(MDataBlock& block, const MEvaluationNode&, const MPlug& plug, MStringArray* messages);
+	static MString plugin_path;
+	static MString openCL_source_file;
 private:
     // helper methods
     void extractWeightArray(MDataBlock& block, const MEvaluationNode& evaluationNode, const MPlug& plug);
@@ -626,6 +628,9 @@ private:
     // Kernel
     MAutoCLKernel fKernel;
 };
+
+MString corSkinGPUDeformer::plugin_path = MString("");
+MString corSkinGPUDeformer::openCL_source_file = "corSkinDef.cl";
 
 class corSkinNodeGPUDeformerInfo : public MGPUDeformerRegistrationInfo
 {
@@ -715,10 +720,11 @@ MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
         // char *maya_location = getenv( "MAYA_LOCATION" );
         // MString openCLKernelFile(maya_location);
         // openCLKernelFile +="/../Extra/devkitBase/devkit/plug-ins/offsetNode/offset.cl";
-        MString openCLKernelFile("C:\\Users\\iam\\Documents\\maya\\2017\\plug-ins\\corSkinDef.cl");
+		MString filepath = corSkinGPUDeformer::plugin_path + MString("/") + corSkinGPUDeformer::openCL_source_file;
+		MString openCLKernelFile(filepath);
 		MString openCLKernelName("corSkinDef");
         fKernel = MOpenCLInfo::getOpenCLKernel(openCLKernelFile, openCLKernelName);
-        if (!fKernel) return MPxGPUDeformer::kDeformerFailure;
+		if (fKernel.isNull()) return MPxGPUDeformer::kDeformerFailure;
     }
     cl_int err = CL_SUCCESS;
     
@@ -780,7 +786,7 @@ MPxGPUDeformer::DeformerStatus corSkinGPUDeformer::evaluate(
 
 void corSkinGPUDeformer::terminate()
 {
-    MHWRender::MRenderer::theRenderer()->releaseGPUMemory(fNumElements*sizeof(float));
+    // MHWRender::MRenderer::theRenderer()->releaseGPUMemory(fNumElements*sizeof(float));
     fCLWeights.reset();
     fCoR.reset();
 	fTM.reset();
@@ -796,8 +802,8 @@ void corSkinGPUDeformer::extractWeightArray(MDataBlock& block, const MEvaluation
     MStatus status;
     // Note that right now dirtyPlugExists takes an attribute, so if any element in the multi is changing we think it is dirty...
     // To avoid false dirty issues here you'd need to only use one element of the MPxDeformerNode::input multi attribute for each
-    // offset node.
-	if ((fCLWeights.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::weightList, &status)) || !status)
+    // corSkinCluster node.
+	if ((!fCLWeights.isNull() && !evaluationNode.dirtyPlugExists(corSkinCluster::weightList, &status)) || !status)
     {
         return;
     }
@@ -820,9 +826,11 @@ void corSkinGPUDeformer::extractWeightArray(MDataBlock& block, const MEvaluation
 		for(int j = 0; j < numTransforms; j ++){
 			stat = weightsHandle.jumpToElement(j);
 			if (stat.error()){
-				temp.push_back(0.0);
+				temp.push_back(0.0f);
 			}else{
-				temp.push_back(weightsHandle.inputValue().asFloat());
+				double asDbl = weightsHandle.inputValue().asDouble();
+				float asFlt = weightsHandle.inputValue().asFloat();
+				temp.push_back((float)asDbl);
 			}
 		}
 		weightListHandle.next();
@@ -834,7 +842,7 @@ void corSkinGPUDeformer::extractWeightArray(MDataBlock& block, const MEvaluation
     cl_int err = CL_SUCCESS;
     if (!fCLWeights.get())
     {
-        MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements*numTransforms*sizeof(float));
+        // MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements*numTransforms*sizeof(float));
         fCLWeights.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, fNumElements * numTransforms * sizeof(float), (void*)&temp[0], &err));
     }
     else
@@ -851,21 +859,10 @@ MStatus corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode&
 	MStatus stat;
 
 	// check for existing CoR in buffer
-	// orig test
-	// if ((fCoR.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::cor_ar, &stat)) || !stat)
-	
-	// get the valid attr
-	MDataHandle valid_handle = block.inputValue(corSkinCluster::cor_valid, &stat);
-	if (stat.error()){
+	// did the weight list change? if so, we need to regrab the CoRs
+	if ((fCoR.get() && !evaluationNode.dirtyPlugExists(corSkinCluster::weightList, &stat)) || !stat){
 		return stat;
 	}
-	bool bValid = valid_handle.asBool();
-
-	// if the CoRs are valid and on the GPU there's nothing to do
-	if (fCoR.get() && bValid)
-    {
-		return MS::kSuccess;
-    }
 
 	// if they're not, pull them off
 	MDataHandle cor_arHandle = block.inputValue(corSkinCluster::cor_ar, &stat);
@@ -891,16 +888,16 @@ MStatus corSkinGPUDeformer::extractCoR(MDataBlock& block, const MEvaluationNode&
 	// all CoR in temp
 
 	cl_int err = CL_SUCCESS;
-    if (!fCLWeights.get())
+	if (!fCoR.get())
     {
-        MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements * 4 * sizeof(float));
-        fCLWeights.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, fNumElements * 4 * sizeof(float), (void*)&temp[0], &err));
+        // MHWRender::MRenderer::theRenderer()->holdGPUMemory(fNumElements * 4 * sizeof(float));
+		fCoR.attach(clCreateBuffer(MOpenCLInfo::getOpenCLContext(), CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY, fNumElements * 4 * sizeof(float), (void*)&temp[0], &err));
     }
     else
     {
         // I use a blocking write here, non-blocking could be faster...  need to manage the lifetime of temp, and have the kernel wait until the write finishes before running
         // I'm also assuming that the weight buffer is not growing.
-        err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fCLWeights.get(), CL_TRUE, 0, fNumElements * 4 * sizeof(float), (void*)&temp[0], 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(MOpenCLInfo::getMayaDefaultOpenCLCommandQueue(), fCoR.get(), CL_TRUE, 0, fNumElements * 4 * sizeof(float), (void*)&temp[0], 0, NULL, NULL);
     }
 
 	return MStatus::kSuccess;
@@ -1034,16 +1031,19 @@ MStatus initializePlugin( MObject obj )
         );
 
 	MString nodeClassName("corSkinCluster");
-	MString registrantId("Benjamin_Slack");
-	MGPUDeformerRegistry::registerGPUDeformerCreator(
+	MString registrantId("corSkinGPUoverride");
+	MStatus stat;
+	stat = MGPUDeformerRegistry::registerGPUDeformerCreator(
 		nodeClassName,
 		registrantId,
 		corSkinGPUDeformer::getGPUDeformerInfo());
 	
-	MGPUDeformerRegistry::addConditionalAttribute(
+	stat = MGPUDeformerRegistry::addConditionalAttribute(
 		nodeClassName,
 		registrantId,
 		corSkinCluster::cor_valid);
+
+	corSkinGPUDeformer::plugin_path = plugin.loadPath();
 
     return result;
 }
@@ -1056,7 +1056,7 @@ MStatus uninitializePlugin( MObject obj )
     result = plugin.deregisterNode( corSkinCluster::id );
 
 	MString nodeClassName("corSkinCluster");
-	MString registrantId("Benjamin_Slack");
+	MString registrantId("corSkinGPUoverride");
 	MGPUDeformerRegistry::deregisterGPUDeformerCreator(
 		nodeClassName,
 		registrantId);
