@@ -1,0 +1,38 @@
+loadPlugin corSkinCluster;
+      
+proc connectJointCluster( string $j, int $i, string $c )
+{
+    if ( !objExists( $j+".lockInfluenceWeights" ) )
+    {
+        select -r $j;
+        addAttr -sn "liw" -ln "lockInfluenceWeights" -at "bool";
+    }
+    connectAttr ($j+".liw") ($c+".lockWeights["+$i+"]");
+    connectAttr ($j+".worldMatrix[0]") ($c+".matrix["+$i+"]");
+    connectAttr ($j+".objectColorRGB") ($c+".influenceColor["+$i+"]");
+	float $m[] = `getAttr ($j+".wim")`;
+	setAttr ($c+".bindPreMatrix["+$i+"]") -type "matrix" $m[0] $m[1] $m[2] $m[3] $m[4] $m[5] $m[6] $m[7] $m[8] $m[9] $m[10] $m[11] $m[12] $m[13] $m[14] $m[15];
+}
+
+string $selected[] = `ls -sl`;
+
+int $len = `size $selected`;
+
+string $geo = $selected[$len-1];
+
+select $geo;
+
+string $skin_cluster[] = `deformer -type "corSkinCluster"`;
+
+string $attr = $skin_cluster[0] + ".useComponentsMatrix";
+
+setAttr $attr 1;
+
+for ($i = 0; $i < $len-1; $i++){
+    // print $selected[$i];
+    connectJointCluster($selected[$i], $i, $skin_cluster[0]);
+}
+
+int $temp = $len - 1;
+
+skinCluster -e -maximumInfluences $temp $skin_cluster;
