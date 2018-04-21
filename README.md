@@ -37,7 +37,7 @@ This plugin is not production ready at this time. It is a prototype.
 No warranty is expressed or implied, use at your own risk.
 
 Licensing:
-This code is licensce under the Createive Common's Attribution-Non-Commercial-
+This code is licensce under the Creative Common's Attribution-Non-Commercial-
 ShareAlike 4.0 license, details of which can be found here:
 
 https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
